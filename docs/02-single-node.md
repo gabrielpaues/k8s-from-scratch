@@ -726,6 +726,14 @@ kubectl apply --kubeconfig=$HOME/admin.kubeconfig \
   -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
 ```
 
+The upstream manifest defaults to `10.244.0.0/16`. Patch it to match this cluster's pod CIDR:
+
+```bash
+kubectl patch configmap -n kube-flannel kube-flannel-cfg --type=merge \
+  -p '{"data":{"net-conf.json":"{\"Network\":\"10.200.0.0/16\",\"Backend\":{\"Type\":\"vxlan\"}}"}}'
+kubectl rollout restart ds -n kube-flannel kube-flannel-ds
+```
+
 Flannel reads the node's `spec.podCIDR` (allocated by the controller-manager) and sets up
 a VXLAN tunnel automatically.
 
@@ -783,7 +791,9 @@ data:
   Corefile: |
     .:53 {
         errors
-        health { lameduck 5s }
+        health {
+            lameduck 5s
+        }
         ready
         kubernetes cluster.local in-addr.arpa ip6.arpa {
            pods insecure
@@ -791,7 +801,7 @@ data:
            ttl 30
         }
         prometheus :9153
-        forward . /etc/resolv.conf { max_concurrent 1000 }
+        forward . 9.9.9.9
         cache 30
         loop
         reload
