@@ -371,7 +371,7 @@ sudo systemctl enable --now etcd
 Verify on any controller:
 
 ```bash
-ETCDCTL_API=3 etcdctl member list \
+sudo ETCDCTL_API=3 etcdctl member list \
   --endpoints=https://127.0.0.1:2379 \
   --cacert=/etc/etcd/ca.pem \
   --cert=/etc/etcd/kubernetes.pem \
@@ -658,7 +658,7 @@ kubectl config use-context kubernetes
 kubectl get nodes -o wide
 
 # etcd cluster health
-ssh ubuntu@${C0} "ETCDCTL_API=3 etcdctl endpoint health \
+ssh ubuntu@${C0} "sudo ETCDCTL_API=3 etcdctl endpoint health \
   --endpoints=https://${C0}:2379,https://${C1}:2379,https://${C2}:2379 \
   --cacert=/etc/etcd/ca.pem \
   --cert=/etc/etcd/kubernetes.pem \

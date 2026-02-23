@@ -414,7 +414,7 @@ sudo systemctl enable --now etcd
 Verify:
 
 ```bash
-ETCDCTL_API=3 etcdctl member list \
+sudo ETCDCTL_API=3 etcdctl member list \
   --endpoints=https://127.0.0.1:2379 \
   --cacert=/etc/etcd/ca.pem \
   --cert=/etc/etcd/kubernetes.pem \
@@ -932,7 +932,7 @@ kubectl run busybox --image=busybox:1.28 --restart=Never --rm -it \
 
 # Test secrets are encrypted at rest
 kubectl create secret generic test-secret --from-literal=key=value
-ETCDCTL_API=3 etcdctl get /registry/secrets/default/test-secret \
+sudo ETCDCTL_API=3 etcdctl get /registry/secrets/default/test-secret \
   --endpoints=https://127.0.0.1:2379 \
   --cacert=/etc/etcd/ca.pem \
   --cert=/etc/etcd/kubernetes.pem \
