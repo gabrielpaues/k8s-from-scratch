@@ -69,6 +69,10 @@ sudo sysctl --system
 
 ## 3. Install containerd, runc, and CNI plugins
 
+Kubernetes does not run containers directly — it delegates that work to a **container runtime** via the Container Runtime Interface (CRI). **containerd** is the runtime: it pulls images, creates and manages container lifecycles, and exposes a CRI socket that kubelet connects to. **runc** is the low-level OCI runtime that containerd calls to actually set up Linux namespaces and cgroups for each container. **CNI plugins** (bridge, host-local, loopback, etc.) handle layer-2 networking within a single node; Flannel (added in step 11) builds on them for cross-node traffic.
+
+We enable `SystemdCgroup = true` so containerd uses the systemd cgroup driver, which is required on Ubuntu 24.04 because the system already uses cgroups v2 managed by systemd. Mismatching cgroup drivers between the runtime and kubelet causes pod startup failures.
+
 Run **on the VM**:
 
 ```bash
@@ -359,6 +363,10 @@ scp encryption-config.yaml ubuntu@${NODE_IP}:~/
 
 ## 7. Bootstrap etcd
 
+**etcd** is the backing store for all cluster state — every pod spec, secret, configmap, node registration, and service definition lives here. The API server is the only component that reads and writes etcd directly; all other components go through the API server. Because etcd is the single source of truth, its data directory is locked down to `700` and all communication is TLS-authenticated with mutual cert verification.
+
+In a single-node setup the cluster has exactly one member, so `--initial-cluster` contains only this node and `--initial-cluster-state new` is safe to use on every start.
+
 Run **on the VM**:
 
 ```bash
@@ -451,6 +459,8 @@ sudo cp ~/kube-controller-manager.kubeconfig ~/kube-scheduler.kubeconfig \
 
 ### kube-apiserver
 
+The **API server** is the front door to Kubernetes. Every `kubectl` command, controller loop, and kubelet registration goes through it. It validates and authenticates requests, enforces RBAC (`--authorization-mode=Node,RBAC`), runs admission plugins, and persists state to etcd. The `NodeRestriction` admission plugin prevents a kubelet from modifying other nodes' objects. Secrets are stored AES-CBC-encrypted on disk via `--encryption-provider-config`. The service-account signing key pair is used to sign and verify tokens injected into pods.
+
 ```bash
 INTERNAL_IP=$(hostname -I | awk '{print $1}')
 
@@ -500,6 +510,8 @@ EOF
 
 ### kube-controller-manager
 
+The **controller manager** runs all the built-in reconciliation loops (controllers) that continuously compare desired state (what you asked for) against actual state (what's running) and take corrective action. Examples include the Deployment controller creating ReplicaSets, the Node controller evicting pods from unreachable nodes, and the ServiceAccount controller creating default service accounts in new namespaces. `--allocate-node-cidrs=true` makes the node IPAM controller automatically carve a `/24` subnet out of `10.200.0.0/16` for each node so Flannel knows which pod IPs belong where. `--use-service-account-credentials=true` means each controller gets its own token rather than sharing the controller-manager's identity, which reduces blast radius if one controller is compromised.
+
 ```bash
 cat <<'EOF' | sudo tee /etc/systemd/system/kube-controller-manager.service
 [Unit]
@@ -530,6 +542,8 @@ EOF
 ```
 
 ### kube-scheduler
+
+The **scheduler** watches for pods that have been created but not yet assigned to a node (`spec.nodeName` is empty) and picks a suitable node based on resource availability, affinity/anti-affinity rules, taints and tolerations, and topology constraints. It only makes the placement decision — it writes `spec.nodeName` back via the API server, and kubelet on the chosen node then starts the pod. On a single node there is only one possible placement, but the scheduler still runs so the cluster behaves the same way as a multi-node setup.
 
 ```bash
 cat <<'EOF' | sudo tee /etc/kubernetes/config/kube-scheduler.yaml
@@ -593,6 +607,8 @@ sudo cp ~/ca.pem /var/lib/kubernetes/
 
 ### kubelet config
 
+**kubelet** is the node agent. It watches the API server for pods scheduled to this node and instructs containerd to start or stop containers accordingly. It also reports node status (CPU/memory capacity, conditions) back to the API server and exposes an HTTPS endpoint that the API server calls for `kubectl exec`, `kubectl logs`, and metrics. Webhook authentication delegates token/cert validation to the API server, and webhook authorization enforces RBAC on those kubelet API calls. `resolvConf` is set to `/run/systemd/resolve/resolv.conf` because Ubuntu 24.04 uses systemd-resolved, and the main `/etc/resolv.conf` only contains a stub that doesn't work inside containers.
+
 ```bash
 cat <<'EOF' | sudo tee /var/lib/kubelet/kubelet-config.yaml
 kind: KubeletConfiguration
@@ -639,6 +655,8 @@ EOF
 ```
 
 ### kube-proxy config
+
+**kube-proxy** runs on every node and maintains iptables rules that implement Kubernetes Services. When you create a Service with a ClusterIP, kube-proxy translates that virtual IP into the real pod IPs by writing iptables `DNAT` rules that load-balance traffic across healthy endpoints. Without kube-proxy, ClusterIP and NodePort services would not work. We use `iptables` mode (the default) because it is reliable and widely supported; `ipvs` mode can be substituted for higher connection rates.
 
 ```bash
 sudo cp ~/kube-proxy.kubeconfig /var/lib/kube-proxy/kubeconfig
@@ -716,8 +734,7 @@ EOF
 
 ## 11. Pod Networking with Flannel
 
-Flannel uses VXLAN to tunnel pod traffic between nodes — this works on OpenStack without
-any allowed-address-pairs changes.
+**Flannel** is a CNI plugin that provides pod-to-pod networking across nodes. It assigns each node a `/24` subnet carved from the pod CIDR (`10.200.0.0/16`) — the subnet is written to `node.spec.podCIDR` by the controller-manager and read by Flannel. It then creates a VXLAN tunnel interface (`flannel.1`) that encapsulates pod traffic in UDP packets before sending it across the underlying network. VXLAN is chosen specifically for OpenStack because it works without modifying `allowed-address-pairs` on ports; plain L3 routing would require OpenStack to forward packets with pod-source IPs, which is blocked by default.
 
 Run **on the VM**:
 
@@ -740,6 +757,8 @@ a VXLAN tunnel automatically.
 ---
 
 ## 12. Deploy CoreDNS
+
+**CoreDNS** is the cluster-internal DNS server. Every Kubernetes Service automatically gets a DNS name (e.g. `my-service.my-namespace.svc.cluster.local`), and pods are configured to resolve names through CoreDNS. kubelet points pods at the CoreDNS service IP (`10.96.0.10`, set via `clusterDNS` in the kubelet config) so DNS works transparently from day one. The `kubernetes` plugin in the Corefile handles in-cluster lookups; unknown names are forwarded upstream to `9.9.9.9` (Quad9). The `forward . /etc/resolv.conf` alternative is not used here because systemd-resolved's stub listener isn't reachable from inside pod network namespaces.
 
 Run **on the VM**:
 

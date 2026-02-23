@@ -51,6 +51,8 @@ ssh ubuntu@${LB_IP} "sudo hostnamectl set-hostname k8s-lb"
 
 ## 2. Prepare All Nodes
 
+Every node — controller and worker alike — needs the same kernel modules (`overlay`, `br_netfilter`), sysctl settings, and container runtime. Controllers run only control-plane processes, but containerd is still needed there because static control-plane pods (if you ever add them) and Flannel's DaemonSet pod run on controllers too. The kernel settings enable iptables bridge filtering and IP forwarding, which are prerequisites for pod networking and kube-proxy.
+
 Run the kernel/sysctl setup and install containerd on **every controller and worker**
 (same commands as [02-single-node.md §2–3](02-single-node.md)):
 
@@ -157,6 +159,8 @@ Same as single-node (admin, kube-controller-manager, kube-proxy, kube-scheduler,
 service-account). Run those commands verbatim.
 
 ### API server certificate — all controller and LB IPs as SANs
+
+TLS clients (kubectl, kubelet, kube-proxy) verify the server certificate's Subject Alternative Names against the address they connected to. In an HA setup clients connect through the LB IP, but each API server also serves directly on its own IP. All of these addresses — every controller IP, the LB IP, `127.0.0.1`, and the standard DNS names — must appear as SANs in a single shared certificate, otherwise TLS handshakes will fail depending on which path traffic takes.
 
 ```bash
 # Substitute real IPs
@@ -312,6 +316,10 @@ done
 
 ## 6. Bootstrap etcd Cluster
 
+etcd uses the **Raft** consensus algorithm to keep all members in sync. With three members the cluster can tolerate the loss of one node and still have a quorum (2 of 3). All three members must be declared in `--initial-cluster` before the cluster is formed for the first time — etcd uses this list to bootstrap peer discovery. The `--initial-cluster-state new` flag tells etcd to expect a fresh cluster; once running, new members are added via `etcdctl member add` instead.
+
+All client and peer communication is TLS-authenticated (`--peer-client-cert-auth`, `--client-cert-auth`), so a compromised node cannot inject data or read secrets from the rest of the cluster.
+
 The three etcd members must know each other up-front via `--initial-cluster`.
 
 Run **on each controller** (adjust `THIS_IP`, `THIS_NAME`, and the peer list):
@@ -387,8 +395,11 @@ Download binaries on each controller (same as single-node §8). Then:
 
 ### kube-apiserver
 
-The key differences from single-node: `--apiserver-count=3`, `--etcd-servers` lists all
-three etcd endpoints, and `--service-account-issuer` points to the LB.
+Each controller runs its own API server instance — they are all active simultaneously (active/active). There is no leader election for the API server itself; the HAProxy load balancer distributes requests across all three. Key differences from single-node:
+
+- `--apiserver-count=3` — tells the API server how many peers exist, used for endpoint advertisement.
+- `--etcd-servers` lists all three etcd endpoints — the API server connects to whichever etcd member is reachable and will automatically failover if one is down.
+- `--service-account-issuer` points to the LB IP — this is the OIDC issuer URL embedded in service-account tokens, so tokens are valid regardless of which API server signed them.
 
 Run **on each controller** (substitute `THIS_IP` appropriately):
 
@@ -448,6 +459,8 @@ EOF
 
 ### kube-controller-manager and kube-scheduler
 
+Unlike the API server, the controller manager and scheduler use **leader election** (`--leader-elect=true` is the default). All three instances run and compete for a lease stored in the API server; only the current leader actively reconciles state — the others stand by and take over instantly if the leader's lease expires. This prevents split-brain: two controller managers running simultaneously could make conflicting decisions (e.g. both trying to scale the same deployment). The unit files are identical to the single-node guide.
+
 Identical to single-node. Copy those unit files and start:
 
 ```bash
@@ -459,6 +472,8 @@ sudo systemctl enable --now kube-apiserver kube-controller-manager kube-schedule
 ---
 
 ## 8. Set Up HAProxy Load Balancer
+
+The load balancer gives clients (kubectl, kubelet, kube-proxy) a single stable endpoint — the LB IP — so they don't need to know which controller is currently healthy or how many there are. **HAProxy** in TCP mode (`mode tcp`) proxies raw TLS connections without terminating them, meaning the API server's certificate is presented directly to clients and end-to-end TLS is preserved. `option tcp-check` performs a TCP health check on each backend; HAProxy stops sending traffic to a controller the moment its port 6443 stops accepting connections. `balance roundrobin` distributes new connections evenly across all healthy controllers.
 
 SSH into the load balancer VM and run:
 
@@ -505,6 +520,8 @@ curl -k https://${LB_IP}:6443/version
 ---
 
 ## 9. Bootstrap Worker Nodes
+
+Workers run only **kubelet** and **kube-proxy** — no control-plane processes. kubelet registers itself with the API server via the kubeconfig (which points to the LB), so if a controller goes down mid-registration kubelet retries against a healthy one. kube-proxy similarly watches the API server through the LB for Service/Endpoint changes and writes iptables rules locally. Each worker gets its own TLS certificate (`system:node:<hostname>`) so the NodeRestriction admission plugin can enforce that it can only modify its own Node object and pods scheduled to it.
 
 For each worker node, follow the same steps as single-node §9, but:
 
@@ -611,6 +628,8 @@ Same as single-node §10. Run once from any controller using the admin kubeconfi
 
 ## 11. Pod Networking with Flannel
 
+Flannel runs as a **DaemonSet**, meaning one pod per node across all controllers and workers. Each Flannel pod reads its node's `spec.podCIDR` (assigned by the controller-manager) and programs a `flannel.1` VXLAN interface for that subnet. When a pod on worker-0 sends a packet to a pod on worker-1, the kernel encapsulates it in a VXLAN UDP frame addressed to worker-1's node IP; Flannel on worker-1 decapsulates it and delivers it to the destination pod. This tunnel layer means OpenStack never sees pod-source IPs, so no `allowed-address-pairs` changes are needed — the only address OpenStack sees is the node's own IP.
+
 Apply from any controller (or from your local machine with `--kubeconfig` pointing to the
 LB):
 
@@ -618,12 +637,19 @@ LB):
 kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
 ```
 
-Flannel's DaemonSet runs on every node and creates VXLAN tunnels automatically. No
-`allowed-address-pairs` changes are needed in OpenStack.
+Patch the CIDR to match this cluster (the upstream manifest defaults to `10.244.0.0/16`):
+
+```bash
+kubectl patch configmap -n kube-flannel kube-flannel-cfg --type=merge \
+  -p '{"data":{"net-conf.json":"{\"Network\":\"10.200.0.0/16\",\"Backend\":{\"Type\":\"vxlan\"}}"}}'
+kubectl rollout restart ds -n kube-flannel kube-flannel-ds
+```
 
 ---
 
 ## 12. Deploy CoreDNS
+
+CoreDNS is deployed once for the whole cluster — it runs as a Deployment (one replica by default) and is reachable at the fixed ClusterIP `10.96.0.10` from every pod on every worker. In a production setup you would increase the replica count to 2 so DNS survives a pod restart, and optionally add an anti-affinity rule to spread the replicas across workers. The manifest is identical to the single-node guide.
 
 Same manifest as single-node §12. Apply once:
 
