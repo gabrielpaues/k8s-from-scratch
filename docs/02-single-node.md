@@ -325,6 +325,7 @@ Copy kubeconfigs to the node:
 ```bash
 scp ${NODE_NAME}.kubeconfig kube-proxy.kubeconfig \
     kube-controller-manager.kubeconfig kube-scheduler.kubeconfig \
+    admin.kubeconfig \
     ubuntu@${NODE_IP}:~/
 ```
 
@@ -564,7 +565,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now kube-apiserver kube-controller-manager kube-scheduler
 
 # Wait ~10 seconds, then verify
-kubectl get --raw='/readyz?verbose' --kubeconfig=~/admin.kubeconfig
+kubectl get --raw='/readyz?verbose' --kubeconfig=$HOME/admin.kubeconfig
 ```
 
 ---
@@ -679,7 +680,7 @@ The API server connects back to kubelet using the `kubernetes` TLS identity. Gra
 necessary permissions. Run **on the VM**:
 
 ```bash
-cat <<'EOF' | kubectl apply --kubeconfig=~/admin.kubeconfig -f -
+cat <<'EOF' | kubectl apply --kubeconfig=$HOME/admin.kubeconfig -f -
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -721,7 +722,7 @@ any allowed-address-pairs changes.
 Run **on the VM**:
 
 ```bash
-kubectl apply --kubeconfig=~/admin.kubeconfig \
+kubectl apply --kubeconfig=$HOME/admin.kubeconfig \
   -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
 ```
 
@@ -735,7 +736,7 @@ a VXLAN tunnel automatically.
 Run **on the VM**:
 
 ```bash
-cat <<'EOF' | kubectl apply --kubeconfig=~/admin.kubeconfig -f -
+cat <<'EOF' | kubectl apply --kubeconfig=$HOME/admin.kubeconfig -f -
 apiVersion: v1
 kind: ServiceAccount
 metadata:
